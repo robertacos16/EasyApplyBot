@@ -9,6 +9,7 @@ import time
 import random
 import pickle
 import os
+import urllib.parse
 
 # Configuration Section
 LINKEDIN_USERNAME = ""  # <-- Replace with your LinkedIn email
@@ -59,6 +60,7 @@ def linkedin_login(username, password):
         time.sleep(5)  # Wait for login to complete
         with open(COOKIE_FILE, "wb") as file:
             pickle.dump(driver.get_cookies(), file)
+        fill_phone_number_if_needed()
     except Exception as e:
         print(f"Error during login: {e}")
 
@@ -72,13 +74,31 @@ def load_cookies():
                 driver.add_cookie(cookie)
         driver.get("https://www.linkedin.com/feed/")
 
+# Fill phone number if LinkedIn prompts for verification
+def fill_phone_number_if_needed(timeout=5):
+    try:
+        phone_input = WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//input[contains(@id,'phone') or contains(@name,'phone') or contains(@aria-label,'phone') or contains(@placeholder,'phone')]")
+            )
+        )
+        if phone_input.get_attribute("value").strip() == "":
+            phone_input.send_keys(PHONE_NUMBER)
+            try:
+                submit_button = driver.find_element(By.XPATH, "//button[@type='submit']")
+                submit_button.click()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 # Job Application Function - Example of Automation
 def apply_to_jobs():
     days_ago = 2  # Start with jobs posted in the last 2 days
     job_title_index = 0  # Start with the first job title
     while True:
         job_title = JOB_TITLES[job_title_index]
-        search_keyword = job_title.replace(' ', '%20')  # URL-encode the job title
+        search_keyword = urllib.parse.quote_plus(job_title)  # Robust URL encoding
         for page in range(1, 4):  # Iterate through the first three pages
             driver.get(f"https://www.linkedin.com/jobs/search/?keywords={search_keyword}&location=Fort%20Lauderdale%2C%20Florida&f_TPR=r{days_ago * 86400}&f_AL=true&sortBy=DD&f_EA=true&distance=50&f_WT=1,2,3&start={25 * (page - 1)}&sortBy=DD")  # Job search URL with pagination, sorted by most recent, including onsite, hybrid, and remote jobs
 
@@ -112,6 +132,7 @@ def apply_to_jobs():
 
                                 # Wait for application form to load
                                 time.sleep(2)
+                                fill_phone_number_if_needed(3)
                                 fill_out_application_form()
 
                                 # Click buttons until application submission is complete
@@ -154,17 +175,28 @@ def apply_to_jobs():
 # Fill Out Application Form Function
 def fill_out_application_form():
     try:
+        def get_lower(el, attr):
+            value = el.get_attribute(attr)
+            return value.lower() if value else ""
+
+        def is_phone_field(el):
+            for attr in ["name", "id", "aria-label", "placeholder"]:
+                val = get_lower(el, attr)
+                if "phone" in val:
+                    return True
+            return False
+
         # Example logic to fill out form fields automatically
         form_fields = driver.find_elements(By.XPATH, "//input[not(@type='hidden') and (@type='text' or @type='tel' or @type='email')]")
         for field in form_fields:
             if field.get_attribute("value").strip() == "":  # Only fill empty fields
-                field_name = field.get_attribute("name").lower()
+                field_name = get_lower(field, "name")
                 if "experience" in field_name or "tools" in field_name:
                     field.send_keys(DEFAULT_EXPERIENCE_ANSWER)
-                elif "phone" in field_name:
-                    field.send_keys(PHONE_NUMBER)  # Use the provided phone number
+                elif is_phone_field(field):
+                    field.send_keys(PHONE_NUMBER)
                 elif "connectwise" in field_name:
-                    field.send_keys("1 year")  # Provide a default value for ConnectWise experience
+                    field.send_keys("1 year")
                 else:
                     field.send_keys(DEFAULT_EXPERIENCE_ANSWER)
 
@@ -179,9 +211,10 @@ def fill_out_application_form():
             if dropdown.get_attribute("value").strip() == "":  # Only fill empty fields
                 options = dropdown.find_elements(By.TAG_NAME, "option")
                 if options:
+                    dropdown_name = get_lower(dropdown, "name")
                     # Always try to select "Yes" if available, otherwise select the first option that is not "Select"
                     for option in options:
-                        if "yes" in option.text.lower() and "need a visa" not in dropdown.get_attribute("name").lower():
+                        if "yes" in option.text.lower() and "need a visa" not in dropdown_name:
                             option.click()
                             break
                     else:
@@ -200,19 +233,20 @@ def fill_out_application_form():
         # Corrected XPath expression for radio buttons
         radio_buttons = driver.find_elements(By.XPATH, "//input[@type='radio']")
         for radio in radio_buttons:
-            radio_name = radio.get_attribute("name").lower()
+            radio_name = get_lower(radio, "name")
+            radio_value = get_lower(radio, "value")
             if not radio.is_selected():
-                if "need a visa" in radio_name and "no" in radio.get_attribute("value").lower():
+                if "need a visa" in radio_name and "no" in radio_value:
                     radio.click()
-                elif "yes" in radio.get_attribute("value").lower() and "need a visa" not in radio_name:
+                elif "yes" in radio_value and "need a visa" not in radio_name:
                     radio.click()
-                elif "no" in radio.get_attribute("value").lower() and ("disability" in radio_name or "veteran" in radio_name):
+                elif "no" in radio_value and ("disability" in radio_name or "veteran" in radio_name):
                     radio.click()
-                elif "yes" in radio.get_attribute("value").lower() and "commuting" in radio_name:
+                elif "yes" in radio_value and "commuting" in radio_name:
                     radio.click()
-                elif "male" in radio.get_attribute("value").lower() and "gender" in radio_name:
+                elif "male" in radio_value and "gender" in radio_name:
                     radio.click()
-                elif "white" in radio.get_attribute("value").lower() and "race" in radio_name:
+                elif "white" in radio_value and "race" in radio_name:
                     radio.click()
     except Exception as e:
         print(f"Error while filling out the application form: {e}")
