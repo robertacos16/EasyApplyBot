@@ -1,267 +1,478 @@
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-import time
-import random
-import pickle
+import json
 import os
-import urllib.parse
+import random
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote_plus
 
-# Configuration Section
-LINKEDIN_USERNAME = ""  # <-- Replace with your LinkedIn email
-LINKEDIN_PASSWORD = ""  # <-- Replace with your LinkedIn password
-PHONE_NUMBER = ""  # <-- Replace with your actual phone number
-LANGUAGE_PROFICIENCIES = {
-    "english": "native or bilingual",
-    "spanish": "native or bilingual",
-    "portuguese": "native or bilingual"
-}
-EXPERIENCE_LEVEL = "1 year"  # Default experience level for fields that ask about experience
-DEFAULT_EXPERIENCE_ANSWER = "1"  # Default answer for experience-related questions
+from selenium import webdriver
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
+from selenium.webdriver import ChromeOptions
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import Select, WebDriverWait
 
-# Define the job titles you want to search for
-JOB_TITLES = [
-    "analyst",
-    "manager",
-    "intern"
-]  # <-- Add any additional keywords as needed
+DEFAULT_TIMEOUT = int(os.getenv("LINKEDIN_TIMEOUT", "15"))
 
-# Chromedriver Setup - Ensure chromedriver is installed and in PATH
-CHROMEDRIVER_PATH = r"C:"  # <-- Modify to the correct path of your Chromedriver
-chrome_options = Options()
-# chrome_options.add_argument("--headless")  # Uncomment this line to run Chrome in headless mode
-chrome_options.add_argument("--no-sandbox")
-chrome_options.add_argument("--disable-dev-shm-usage")
 
-service = Service(CHROMEDRIVER_PATH)
-driver = webdriver.Chrome(service=service, options=chrome_options)
+def truthy(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
-COOKIE_FILE = "linkedin_cookies.pkl"
 
-# LinkedIn Login Function
-def linkedin_login(username, password):
-    driver.get("https://www.linkedin.com/login")
-    try:
-        username_field = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, "username"))
+def json_env(name: str) -> dict[str, str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{name} must be a JSON object.")
+    return {str(key).lower(): str(value) for key, value in data.items()}
+
+
+@dataclass(frozen=True)
+class BotConfig:
+    email: str = ""
+    password: str = ""
+    phone: str = ""
+    search_terms: list[str] = field(default_factory=lambda: ["analyst", "manager", "intern"])
+    location: str = "Fort Lauderdale, Florida"
+    max_applications: int = 25
+    pages_per_search: int = 2
+    days_back_start: int = 2
+    days_back_max: int = 30
+    dry_run: bool = True
+    headless: bool = False
+    cookie_file: Path = Path("linkedin_cookies.json")
+    seen_jobs_file: Path = Path("seen_jobs.json")
+    application_log: Path = Path("applications_log.jsonl")
+    default_answer: str | None = "1"
+    custom_answers: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_env(cls) -> "BotConfig":
+        terms = [term.strip() for term in os.getenv("LINKEDIN_SEARCH_TERMS", "analyst,manager,intern").split(",") if term.strip()]
+        return cls(
+            email=os.getenv("LINKEDIN_EMAIL", ""),
+            password=os.getenv("LINKEDIN_PASSWORD", ""),
+            phone=os.getenv("LINKEDIN_PHONE", ""),
+            search_terms=terms,
+            location=os.getenv("LINKEDIN_LOCATION", "Fort Lauderdale, Florida"),
+            max_applications=int(os.getenv("LINKEDIN_MAX_APPLICATIONS", "25")),
+            pages_per_search=int(os.getenv("LINKEDIN_PAGES_PER_SEARCH", "2")),
+            days_back_start=int(os.getenv("LINKEDIN_DAYS_BACK_START", "2")),
+            days_back_max=int(os.getenv("LINKEDIN_DAYS_BACK_MAX", "30")),
+            dry_run=truthy(os.getenv("LINKEDIN_DRY_RUN"), default=True),
+            headless=truthy(os.getenv("LINKEDIN_HEADLESS"), default=False),
+            cookie_file=Path(os.getenv("LINKEDIN_COOKIE_FILE", "linkedin_cookies.json")),
+            seen_jobs_file=Path(os.getenv("LINKEDIN_SEEN_JOBS_FILE", "seen_jobs.json")),
+            application_log=Path(os.getenv("LINKEDIN_APPLICATION_LOG", "applications_log.jsonl")),
+            default_answer=os.getenv("LINKEDIN_DEFAULT_ANSWER", "1") or None,
+            custom_answers=json_env("LINKEDIN_CUSTOM_ANSWERS"),
         )
-        password_field = driver.find_element(By.ID, "password")
-        login_button = driver.find_element(By.XPATH, "//button[@type='submit']")
 
-        username_field.send_keys(username)
-        password_field.send_keys(password)
-        login_button.click()
+    def validate(self) -> None:
+        if not self.search_terms:
+            raise RuntimeError("Set at least one search term.")
+        if self.max_applications < 1:
+            raise RuntimeError("LINKEDIN_MAX_APPLICATIONS must be at least 1.")
+        if self.pages_per_search < 1:
+            raise RuntimeError("LINKEDIN_PAGES_PER_SEARCH must be at least 1.")
+        if self.days_back_start < 1 or self.days_back_max < self.days_back_start:
+            raise RuntimeError("The days-back range is invalid.")
+        if not self.dry_run and (not self.email or not self.password):
+            raise RuntimeError("Set LINKEDIN_EMAIL and LINKEDIN_PASSWORD before live mode.")
 
-        # Save cookies after successful login
-        time.sleep(5)  # Wait for login to complete
-        with open(COOKIE_FILE, "wb") as file:
-            pickle.dump(driver.get_cookies(), file)
-        fill_phone_number_if_needed()
-    except Exception as e:
-        print(f"Error during login: {e}")
 
-# Load Cookies Function
-def load_cookies():
-    if os.path.exists(COOKIE_FILE):
-        driver.get("https://www.linkedin.com")
-        with open(COOKIE_FILE, "rb") as file:
-            cookies = pickle.load(file)
-            for cookie in cookies:
-                driver.add_cookie(cookie)
-        driver.get("https://www.linkedin.com/feed/")
+class LinkedInEasyApplyBot:
+    def __init__(self, config: BotConfig) -> None:
+        config.validate()
+        self.config = config
+        self.driver = self.build_driver()
+        self.wait = WebDriverWait(self.driver, DEFAULT_TIMEOUT)
+        self.applications_sent = 0
+        self.jobs_seen = self.load_seen_jobs()
 
-# Fill phone number if LinkedIn prompts for verification
-def fill_phone_number_if_needed(timeout=5):
-    try:
-        phone_input = WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//input[contains(@id,'phone') or contains(@name,'phone') or contains(@aria-label,'phone') or contains(@placeholder,'phone')]")
-            )
+    def build_driver(self):
+        options = ChromeOptions()
+        options.add_argument("--start-maximized")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        if self.config.headless:
+            options.add_argument("--headless=new")
+            options.add_argument("--window-size=1440,1000")
+        return webdriver.Chrome(options=options)
+
+    def run(self) -> None:
+        try:
+            self.login()
+            while self.applications_sent < self.config.max_applications:
+                made_progress = self.apply_recent_then_older_jobs()
+                if not made_progress:
+                    print("No new jobs found in this cycle. Waiting before checking most recent jobs again.")
+                    time.sleep(random.uniform(60, 120))
+        finally:
+            self.save_seen_jobs()
+            self.driver.quit()
+
+    def login(self) -> None:
+        self.driver.get("https://www.linkedin.com/")
+        if self.load_cookies():
+            self.driver.get("https://www.linkedin.com/feed/")
+            if self.is_logged_in():
+                print("Logged in with saved cookies.")
+                return
+        if not self.config.email or not self.config.password:
+            raise RuntimeError("Set LINKEDIN_EMAIL and LINKEDIN_PASSWORD, or provide a valid cookie file.")
+        self.driver.get("https://www.linkedin.com/login")
+        self.type(By.ID, "username", self.config.email)
+        self.type(By.ID, "password", self.config.password)
+        self.click(By.CSS_SELECTOR, "button[type='submit']")
+        try:
+            self.wait.until(lambda _: self.is_logged_in())
+        except TimeoutException as exc:
+            raise RuntimeError("Login did not finish. Check for MFA, captcha, or incorrect credentials.") from exc
+        self.save_cookies()
+        print("Logged in and saved cookies.")
+
+    def apply_recent_then_older_jobs(self) -> bool:
+        made_progress = False
+        days_options = [self.config.days_back_start] + list(range(self.config.days_back_start + 1, self.config.days_back_max + 1))
+        for days_back in days_options:
+            for term in self.config.search_terms:
+                if self.applications_sent >= self.config.max_applications:
+                    return made_progress
+                print(f"Searching '{term}' from the last {days_back} day(s), most recent first.")
+                if self.apply_for_search(term, days_back):
+                    made_progress = True
+            if made_progress:
+                return True
+        return made_progress
+
+    def apply_for_search(self, search_term: str, days_back: int) -> bool:
+        made_progress = False
+        for page in range(self.config.pages_per_search):
+            if self.applications_sent >= self.config.max_applications:
+                return made_progress
+            self.driver.get(self.jobs_url(search_term, days_back, page))
+            self.pause(2.0, 4.0)
+            self.dismiss_overlays()
+            cards = self.job_cards()
+            print(f"Page {page + 1}: found {len(cards)} visible jobs.")
+            for index in range(len(cards)):
+                if self.try_apply_to_card(index):
+                    made_progress = True
+                if self.applications_sent >= self.config.max_applications:
+                    return made_progress
+        return made_progress
+
+    def jobs_url(self, search_term: str, days_back: int, page: int) -> str:
+        seconds = days_back * 86400
+        return (
+            "https://www.linkedin.com/jobs/search/"
+            f"?keywords={quote_plus(search_term)}"
+            f"&location={quote_plus(self.config.location)}"
+            f"&f_TPR=r{seconds}"
+            "&f_AL=true&sortBy=DD&f_EA=true&distance=50&f_WT=1,2,3"
+            f"&start={page * 25}"
         )
-        if phone_input.get_attribute("value").strip() == "":
-            phone_input.send_keys(PHONE_NUMBER)
-            try:
-                submit_button = driver.find_element(By.XPATH, "//button[@type='submit']")
-                submit_button.click()
-            except Exception:
-                pass
-    except Exception:
-        pass
 
-# Job Application Function - Example of Automation
-def apply_to_jobs():
-    days_ago = 2  # Start with jobs posted in the last 2 days
-    job_title_index = 0  # Start with the first job title
-    while True:
-        job_title = JOB_TITLES[job_title_index]
-        search_keyword = urllib.parse.quote_plus(job_title)  # Robust URL encoding
-        for page in range(1, 4):  # Iterate through the first three pages
-            driver.get(f"https://www.linkedin.com/jobs/search/?keywords={search_keyword}&location=Fort%20Lauderdale%2C%20Florida&f_TPR=r{days_ago * 86400}&f_AL=true&sortBy=DD&f_EA=true&distance=50&f_WT=1,2,3&start={25 * (page - 1)}&sortBy=DD")  # Job search URL with pagination, sorted by most recent, including onsite, hybrid, and remote jobs
-
-            try:
-                jobs = WebDriverWait(driver, 20).until(
-                    EC.presence_of_all_elements_located((By.CLASS_NAME, "job-card-container"))
-                )
-                if not jobs:
-                    continue
-                for job in jobs:
-                    start_time = time.time()
-                    try:
-                        retry_count = 3
-                        while retry_count > 0:
-                            try:
-                                job.click()
-                                # Handle job search safety reminder
-                                try:
-                                    continue_button = WebDriverWait(driver, 5).until(
-                                        EC.element_to_be_clickable((By.XPATH, "//button[text()='Continue applying']"))
-                                    )
-                                    continue_button.click()
-                                except:
-                                    pass
-
-                                # Increase waiting time for the easy apply button
-                                easy_apply_button = WebDriverWait(driver, 15).until(
-                                    EC.element_to_be_clickable((By.XPATH, "//button[contains(@class, 'jobs-apply-button')]"))
-                                )
-                                easy_apply_button.click()
-
-                                # Wait for application form to load
-                                time.sleep(2)
-                                fill_phone_number_if_needed(3)
-                                fill_out_application_form()
-
-                                # Click buttons until application submission is complete
-                                while True:
-                                    if time.time() - start_time > 120:
-                                        print("Timeout reached, moving to the next job title or search criteria.")
-                                        break
-                                    try:
-                                        button = WebDriverWait(driver, 15).until(
-                                            EC.element_to_be_clickable((By.XPATH, "//button[contains(@aria-label, 'Continue') or contains(@aria-label, 'Next') or contains(@aria-label, 'Review') or contains(@aria-label, 'Submit application')]"))
-                                        )
-                                        button.click()
-                                        time.sleep(2)
-                                        fill_out_application_form()  # Fill out fields on each page if any
-                                        if "Submit application" in button.get_attribute("aria-label"):
-                                            print(f"Applied to job containing keyword '{job_title}' successfully!")
-                                            time.sleep(random.uniform(2, 5))  # Random delay to avoid detection
-                                            break
-                                    except Exception as e:
-                                        print(f"Error during button click: {e}")
-                                        break
-                                break
-                            except Exception as e:
-                                retry_count -= 1
-                                if retry_count == 0:
-                                    raise e
-                                else:
-                                    print(f"Retrying due to exception: {e}")
-                                    time.sleep(2)
-                    except Exception as e:
-                        print(f"Could not apply to job containing keyword '{job_title}': {e}")
-                        continue
-            except Exception as e:
-                print(f"Error during job search for '{job_title}' on page {page} with {days_ago} days filter: {e}")
-        job_title_index = (job_title_index + 1) % len(JOB_TITLES)  # Switch to the next job title
-        days_ago += 1  # Expand the search if fewer jobs are available
-        if days_ago > 30:
-            days_ago = 2  # Reset to 2 days and move to the next job title
-
-# Fill Out Application Form Function
-def fill_out_application_form():
-    try:
-        def get_lower(el, attr):
-            value = el.get_attribute(attr)
-            return value.lower() if value else ""
-
-        def is_phone_field(el):
-            for attr in ["name", "id", "aria-label", "placeholder"]:
-                val = get_lower(el, attr)
-                if "phone" in val:
-                    return True
+    def try_apply_to_card(self, index: int) -> bool:
+        try:
+            cards = self.job_cards()
+            if index >= len(cards):
+                return False
+            card = cards[index]
+            key = self.job_key(card)
+            if not key or key in self.jobs_seen:
+                return False
+            self.jobs_seen.add(key)
+            self.scroll_into_view(card)
+            card.click()
+            self.pause()
+            self.dismiss_overlays()
+            easy_apply = self.button_by_text(("Easy Apply",))
+            if not easy_apply:
+                return False
+            title = self.safe_text(By.CSS_SELECTOR, "h1") or key
+            print(f"Opening Easy Apply: {title}")
+            self.safe_click(easy_apply)
+            self.pause()
+            return self.complete_application_flow(title, key)
+        except (ElementClickInterceptedException, NoSuchElementException, StaleElementReferenceException, TimeoutException) as exc:
+            print(f"Skipped job because the page changed or blocked an action: {exc}")
+            self.close_application_modal()
             return False
 
-        # Example logic to fill out form fields automatically
-        form_fields = driver.find_elements(By.XPATH, "//input[not(@type='hidden') and (@type='text' or @type='tel' or @type='email')]")
-        for field in form_fields:
-            if field.get_attribute("value").strip() == "":  # Only fill empty fields
-                field_name = get_lower(field, "name")
-                if "experience" in field_name or "tools" in field_name:
-                    field.send_keys(DEFAULT_EXPERIENCE_ANSWER)
-                elif is_phone_field(field):
-                    field.send_keys(PHONE_NUMBER)
-                elif "connectwise" in field_name:
-                    field.send_keys("1 year")
-                else:
-                    field.send_keys(DEFAULT_EXPERIENCE_ANSWER)
+    def complete_application_flow(self, title: str, key: str) -> bool:
+        for _ in range(12):
+            self.dismiss_overlays()
+            self.fill_current_form()
+            submit = self.button_by_text(("Submit application", "Submit"))
+            if submit:
+                if self.config.dry_run:
+                    print("Dry run: reached final submit, closing application.")
+                    self.write_application_log(title, key, "dry-run-ready")
+                    self.close_application_modal()
+                    return True
+                self.safe_click(submit)
+                self.applications_sent += 1
+                self.write_application_log(title, key, "submitted")
+                print(f"Submitted application #{self.applications_sent}.")
+                self.pause(1.5, 3.0)
+                return True
+            next_button = self.button_by_text(("Next", "Review", "Continue"))
+            if next_button:
+                self.safe_click(next_button)
+                self.pause(1.0, 2.0)
+                continue
+            print("Could not confidently complete this form; discarding it.")
+            self.write_application_log(title, key, "skipped-incomplete-form")
+            self.close_application_modal()
+            return False
+        print("Application flow had too many steps; discarding it.")
+        self.write_application_log(title, key, "skipped-too-many-steps")
+        self.close_application_modal()
+        return False
 
-        # Handle numerical experience questions
-        numerical_fields = driver.find_elements(By.XPATH, "//input[@type='text' and (contains(@aria-label, 'experience') or contains(@aria-label, 'years'))]")
-        for field in numerical_fields:
-            if field.get_attribute("value").strip() == "":  # Only fill empty fields
-                field.send_keys(DEFAULT_EXPERIENCE_ANSWER)
+    def fill_current_form(self) -> None:
+        self.fill_text_inputs()
+        self.fill_selects()
+        self.fill_radios()
+        self.fill_checkboxes()
 
-        dropdowns = driver.find_elements(By.XPATH, "//select")
-        for dropdown in dropdowns:
-            if dropdown.get_attribute("value").strip() == "":  # Only fill empty fields
-                options = dropdown.find_elements(By.TAG_NAME, "option")
-                if options:
-                    dropdown_name = get_lower(dropdown, "name")
-                    # Always try to select "Yes" if available, otherwise select the first option that is not "Select"
-                    for option in options:
-                        if "yes" in option.text.lower() and "need a visa" not in dropdown_name:
-                            option.click()
-                            break
-                    else:
-                        # Select the first available option that is not "Select"
-                        for option in options:
-                            if "select" not in option.text.lower():
-                                option.click()
-                                break
+    def fill_text_inputs(self) -> None:
+        selector = "input:not([type='hidden']):not([type='file']):not([type='checkbox']):not([type='radio']), textarea"
+        for element in self.driver.find_elements(By.CSS_SELECTOR, selector):
+            if not self.is_interactable(element) or element.get_attribute("value"):
+                continue
+            answer = self.answer_for_label(self.field_label(element).lower())
+            if answer is None:
+                continue
+            self.scroll_into_view(element)
+            element.clear()
+            element.send_keys(answer)
 
-        # Handle checkboxes and radio buttons
-        checkboxes = driver.find_elements(By.XPATH, "//input[@type='checkbox']")
-        for checkbox in checkboxes:
-            if not checkbox.is_selected():
-                checkbox.click()
+    def fill_selects(self) -> None:
+        for element in self.driver.find_elements(By.TAG_NAME, "select"):
+            if not self.is_interactable(element):
+                continue
+            select = Select(element)
+            selected = select.first_selected_option.text.strip()
+            if selected and not re.search(r"select|choose", selected, re.I):
+                continue
+            label = self.field_label(element).lower()
+            preferred = self.answer_for_label(label)
+            options = [option for option in select.options if option.get_attribute("value") and option.text.strip()]
+            if not options:
+                continue
+            match = None
+            if preferred:
+                match = next((option for option in options if preferred.lower() in option.text.lower()), None)
+            select.select_by_visible_text((match or options[0]).text)
 
-        # Corrected XPath expression for radio buttons
-        radio_buttons = driver.find_elements(By.XPATH, "//input[@type='radio']")
-        for radio in radio_buttons:
-            radio_name = get_lower(radio, "name")
-            radio_value = get_lower(radio, "value")
-            if not radio.is_selected():
-                if "need a visa" in radio_name and "no" in radio_value:
-                    radio.click()
-                elif "yes" in radio_value and "need a visa" not in radio_name:
-                    radio.click()
-                elif "no" in radio_value and ("disability" in radio_name or "veteran" in radio_name):
-                    radio.click()
-                elif "yes" in radio_value and "commuting" in radio_name:
-                    radio.click()
-                elif "male" in radio_value and "gender" in radio_name:
-                    radio.click()
-                elif "white" in radio_value and "race" in radio_name:
-                    radio.click()
-    except Exception as e:
-        print(f"Error while filling out the application form: {e}")
+    def fill_radios(self) -> None:
+        groups: dict[str, list] = {}
+        for radio in self.driver.find_elements(By.CSS_SELECTOR, "input[type='radio']"):
+            if self.is_interactable(radio) and not radio.is_selected():
+                groups.setdefault(radio.get_attribute("name") or radio.id, []).append(radio)
+        for radios in groups.values():
+            label = " ".join(self.field_label(radio).lower() for radio in radios)
+            preferred = self.answer_for_label(label)
+            target = self.radio_by_text(radios, preferred) or self.radio_by_text(radios, "yes")
+            if target:
+                self.safe_click(target)
 
-# Main Execution
-try:
-    load_cookies()
-    time.sleep(5)  # Wait for cookies to load
-    if "feed" not in driver.current_url:
-        linkedin_login(LINKEDIN_USERNAME, LINKEDIN_PASSWORD)
-    apply_to_jobs()
-finally:
-    driver.quit()  # Close the browser
+    def fill_checkboxes(self) -> None:
+        for checkbox in self.driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']"):
+            if self.is_interactable(checkbox) and not checkbox.is_selected():
+                label = self.field_label(checkbox).lower()
+                if any(word in label for word in ("agree", "confirm", "certify", "terms", "acknowledge")):
+                    self.safe_click(checkbox)
 
-# Notes:
-# 1. Replace LINKEDIN_USERNAME and LINKEDIN_PASSWORD with your actual LinkedIn login details.
-# 2. Ensure that the chromedriver version matches your installed Chrome version.
-# 3. Add more detailed form-filling logic as needed for specific job postings. Please make sure it keeps applying to jobs for the last month and also keeps looking for the most recent jobs, like a sorting type of thing, like all of the jobs from the most recent job tabs then next then another job title and it goes from job title to job title until their first 2 tabs are all applied for then we keep applying to all most recent jobs since jobs just keep getting posted, if for any reason no new jobs were getting posted just apply to job categories up to a month old.
+    def answer_for_label(self, label: str) -> str | None:
+        label = " ".join(label.split()).lower()
+        for key, value in self.config.custom_answers.items():
+            if key in label and value:
+                return value
+        answers = {
+            "phone": self.config.phone,
+            "mobile": self.config.phone,
+            "email": self.config.email,
+            "salary": os.getenv("LINKEDIN_DESIRED_SALARY", ""),
+            "notice": os.getenv("LINKEDIN_NOTICE_PERIOD", "2 weeks"),
+            "sponsorship": os.getenv("LINKEDIN_SPONSORSHIP", "No"),
+            "authorized": os.getenv("LINKEDIN_WORK_AUTHORIZED", "Yes"),
+            "work authorization": os.getenv("LINKEDIN_WORK_AUTHORIZED", "Yes"),
+            "years": os.getenv("LINKEDIN_DEFAULT_YEARS", "1"),
+            "experience": os.getenv("LINKEDIN_DEFAULT_YEARS", "1"),
+            "commute": os.getenv("LINKEDIN_COMMUTE", "Yes"),
+            "relocate": os.getenv("LINKEDIN_RELOCATE", "Yes"),
+        }
+        for key, value in answers.items():
+            if key in label and value:
+                return value
+        return self.config.default_answer
+
+    def field_label(self, element) -> str:
+        aria = element.get_attribute("aria-label")
+        if aria:
+            return aria
+        element_id = element.get_attribute("id")
+        if element_id:
+            labels = self.driver.find_elements(By.CSS_SELECTOR, f"label[for='{element_id}']")
+            if labels:
+                return labels[0].text
+        try:
+            parent = element.find_element(By.XPATH, "./ancestor::*[self::label or self::fieldset or contains(@class, 'jobs-easy-apply-form-section')][1]")
+            return parent.text
+        except NoSuchElementException:
+            return element.text or element.get_attribute("placeholder") or ""
+
+    def radio_by_text(self, radios, answer: str | None):
+        if not answer:
+            return None
+        answer = answer.lower()
+        for radio in radios:
+            label = self.field_label(radio).lower()
+            value = (radio.get_attribute("value") or "").lower()
+            if answer in label or answer == value:
+                return radio
+        return None
+
+    def job_cards(self) -> list:
+        selectors = ("li[data-occludable-job-id]", "li.jobs-search-results__list-item", ".job-card-container", "[data-job-id]")
+        for selector in selectors:
+            cards = [card for card in self.driver.find_elements(By.CSS_SELECTOR, selector) if card.is_displayed()]
+            if cards:
+                return cards
+        return []
+
+    def job_key(self, card) -> str:
+        for attr in ("data-occludable-job-id", "data-job-id"):
+            value = card.get_attribute(attr)
+            if value:
+                return value
+        try:
+            return card.find_element(By.CSS_SELECTOR, "a[href*='/jobs/view/']").get_attribute("href")
+        except NoSuchElementException:
+            return card.text[:200]
+
+    def button_by_text(self, labels: tuple[str, ...]):
+        for selector in ("button", "[role='button']"):
+            for button in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                if not self.is_interactable(button):
+                    continue
+                text = " ".join(button.text.split())
+                aria = button.get_attribute("aria-label") or ""
+                if any(label.lower() in text.lower() or label.lower() in aria.lower() for label in labels):
+                    return button
+        return None
+
+    def dismiss_overlays(self) -> None:
+        for label in ("Dismiss", "Close", "Not now", "No thanks"):
+            button = self.button_by_text((label,))
+            if button:
+                try:
+                    self.safe_click(button)
+                    self.pause(0.3, 0.8)
+                except Exception:
+                    pass
+
+    def close_application_modal(self) -> None:
+        close = self.button_by_text(("Dismiss", "Close"))
+        if close:
+            self.safe_click(close)
+            self.pause()
+        discard = self.button_by_text(("Discard", "Discard application"))
+        if discard:
+            self.safe_click(discard)
+            self.pause()
+
+    def is_logged_in(self) -> bool:
+        selector = "a[href*='/feed/'], a[href*='/mynetwork/'], input[placeholder*='Search']"
+        return bool(self.driver.find_elements(By.CSS_SELECTOR, selector))
+
+    def load_cookies(self) -> bool:
+        if not self.config.cookie_file.exists():
+            return False
+        with self.config.cookie_file.open("r", encoding="utf-8") as file:
+            cookies = json.load(file)
+        for cookie in cookies:
+            cookie.pop("sameSite", None)
+            try:
+                self.driver.add_cookie(cookie)
+            except Exception:
+                pass
+        return True
+
+    def save_cookies(self) -> None:
+        with self.config.cookie_file.open("w", encoding="utf-8") as file:
+            json.dump(self.driver.get_cookies(), file, indent=2)
+
+    def load_seen_jobs(self) -> set[str]:
+        if not self.config.seen_jobs_file.exists():
+            return set()
+        try:
+            with self.config.seen_jobs_file.open("r", encoding="utf-8") as file:
+                return {str(item) for item in json.load(file) if item}
+        except Exception:
+            return set()
+
+    def save_seen_jobs(self) -> None:
+        with self.config.seen_jobs_file.open("w", encoding="utf-8") as file:
+            json.dump(sorted(self.jobs_seen), file, indent=2)
+
+    def write_application_log(self, title: str, key: str, status: str) -> None:
+        entry = {"time": datetime.now(timezone.utc).isoformat(), "title": title, "job_key": key, "status": status, "dry_run": self.config.dry_run}
+        with self.config.application_log.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(entry) + "\n")
+
+    def click(self, by, value: str) -> None:
+        self.safe_click(self.wait.until(EC.element_to_be_clickable((by, value))))
+
+    def type(self, by, value: str, text: str) -> None:
+        element = self.wait.until(EC.visibility_of_element_located((by, value)))
+        element.clear()
+        element.send_keys(text)
+
+    def safe_click(self, element) -> None:
+        self.scroll_into_view(element)
+        try:
+            element.click()
+        except ElementClickInterceptedException:
+            self.driver.execute_script("arguments[0].click();", element)
+
+    def scroll_into_view(self, element) -> None:
+        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", element)
+
+    def safe_text(self, by, value: str) -> str:
+        try:
+            return self.driver.find_element(by, value).text.strip()
+        except NoSuchElementException:
+            return ""
+
+    def is_interactable(self, element) -> bool:
+        try:
+            return element.is_displayed() and element.is_enabled()
+        except Exception:
+            return False
+
+    def pause(self, low: float = 0.8, high: float = 1.8) -> None:
+        time.sleep(random.uniform(low, high))
+
+
+if __name__ == "__main__":
+    mode = "DRY RUN" if truthy(os.getenv("LINKEDIN_DRY_RUN"), default=True) else "LIVE SUBMIT"
+    print(f"Starting EasyApplyBot in {mode} mode.")
+    LinkedInEasyApplyBot(BotConfig.from_env()).run()
