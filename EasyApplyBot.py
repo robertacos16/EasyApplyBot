@@ -373,31 +373,52 @@ class LinkedInEasyApplyBot:
             for button in self.driver.find_elements(By.CSS_SELECTOR, selector):
                 if not self.is_interactable(button):
                     continue
-                text = " ".join(button.text.split())
-                aria = button.get_attribute("aria-label") or ""
-                if any(label.lower() in text.lower() or label.lower() in aria.lower() for label in labels):
+                if self.button_matches(button, labels):
                     return button
         return None
 
+    def button_matches(self, button, labels: tuple[str, ...]) -> bool:
+        text = " ".join(button.text.split())
+        aria = button.get_attribute("aria-label") or ""
+        return any(label.lower() in text.lower() or label.lower() in aria.lower() for label in labels)
+
     def dismiss_overlays(self) -> None:
-        for label in ("Dismiss", "Close", "Not now", "No thanks"):
-            button = self.button_by_text((label,))
-            if button:
-                try:
-                    self.safe_click(button)
-                    self.pause(0.3, 0.8)
-                except Exception:
-                    pass
+        overlay_selectors = (
+            "[role='dialog'] button",
+            ".artdeco-modal button",
+            ".msg-overlay-bubble-header button",
+            ".artdeco-toast-item button",
+        )
+        for selector in overlay_selectors:
+            for button in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                if not self.is_interactable(button):
+                    continue
+                if self.button_matches(button, ("Dismiss", "Close", "Not now", "No thanks")):
+                    try:
+                        self.safe_click(button)
+                        self.pause(0.3, 0.8)
+                    except Exception:
+                        pass
 
     def close_application_modal(self) -> None:
-        close = self.button_by_text(("Dismiss", "Close"))
+        close = self.modal_button_by_text(("Dismiss", "Close"))
         if close:
             self.safe_click(close)
             self.pause()
-        discard = self.button_by_text(("Discard", "Discard application"))
+        discard = self.modal_button_by_text(("Discard", "Discard application"))
         if discard:
             self.safe_click(discard)
             self.pause()
+
+    def modal_button_by_text(self, labels: tuple[str, ...]):
+        for modal_selector in ("[role='dialog']", ".artdeco-modal", ".jobs-easy-apply-modal"):
+            for modal in self.driver.find_elements(By.CSS_SELECTOR, modal_selector):
+                if not modal.is_displayed():
+                    continue
+                for button in modal.find_elements(By.CSS_SELECTOR, "button,[role='button']"):
+                    if self.is_interactable(button) and self.button_matches(button, labels):
+                        return button
+        return None
 
     def is_logged_in(self) -> bool:
         selector = "a[href*='/feed/'], a[href*='/mynetwork/'], input[placeholder*='Search']"
