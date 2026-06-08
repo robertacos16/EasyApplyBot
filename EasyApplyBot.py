@@ -91,6 +91,8 @@ class BotConfig:
             raise RuntimeError("The days-back range is invalid.")
         if not self.dry_run and (not self.email or not self.password):
             raise RuntimeError("Set LINKEDIN_EMAIL and LINKEDIN_PASSWORD before live mode.")
+        if not self.dry_run and not self.phone:
+            raise RuntimeError("Set LINKEDIN_PHONE before live mode.")
 
 
 class LinkedInEasyApplyBot:
@@ -305,10 +307,11 @@ class LinkedInEasyApplyBot:
         for key, value in self.config.custom_answers.items():
             if key in label and value:
                 return value
+        if any(key in label for key in ("phone", "mobile")):
+            return self.config.phone or None
+        if "email" in label:
+            return self.config.email or None
         answers = {
-            "phone": self.config.phone,
-            "mobile": self.config.phone,
-            "email": self.config.email,
             "salary": os.getenv("LINKEDIN_DESIRED_SALARY", ""),
             "notice": os.getenv("LINKEDIN_NOTICE_PERIOD", "2 weeks"),
             "sponsorship": os.getenv("LINKEDIN_SPONSORSHIP", "No"),
